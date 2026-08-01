@@ -14,7 +14,7 @@ attributes are requested, regardless of flag combinations. Confirmed on Windows 
 ## Quickstart
 
 ```bash
-pip install "impacket>=0.12.0,<0.14.0"
+pip install "impacket==0.13.1"
 
 python3 tester/stealth_dcsync_test.py \
     --dc <dc-ip> \

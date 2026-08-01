@@ -6,7 +6,7 @@ The standalone harness calls DRSGetNCChanges directly via impacket's DRSUAPI bin
 No patch or secretsdump.py modification required.
 
 ```bash
-pip install "impacket>=0.12.0,<0.14.0"
+pip install "impacket==0.13.1"
 
 python3 tester/stealth_dcsync_test.py \
     --dc 192.168.1.10 \
