@@ -1,0 +1,19 @@
+title = "dcsync-variant-tester gitleaks config"
+
+[allowlist]
+description = "Lab credentials — these are ephemeral VM-only accounts, not production secrets"
+
+paths = [
+  "results/",
+  "docs/",
+  "tester/",
+]
+
+regexes = [
+  "e02bc503339d51f71d913c245d35b50b",
+  "aad3b435b51404eeaad3b435b51404ee",
+]
+
+[[allowlist.per-regex-stages]]
+regex = "vagrant|Test123!"
+paths = ["results/", "docs/"]
