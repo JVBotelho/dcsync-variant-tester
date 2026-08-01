@@ -256,35 +256,85 @@ Behavior is cross-version consistent.
 
 ---
 
-### Revised Conclusions
+### Tiebreaker Round — Tool vs DC vs Flags
 
-1. **`0x20f7` is NOT a missing-Get-Changes-All indicator.** It is returned
-   when the calling user lacks administrative group membership, regardless
-   of extended rights. Hypothesis (a) — "artifact of lab setup" — is
-   **FALSIFIED**. The denial is real and consistent.
+**Objective:** The isolation round left three competing explanations for why
+a delegated account (Get-Changes + Get-Changes-All, no admin group) receives
+0x20f7: (i) DC requires admin membership, (ii) impacket-specific behavior,
+(iii) DRS_WRIT_REP flag triggers the check.
 
-2. **The DCSync authorization model requires BOTH:**
-   ```
-   [REQUIRED] Membership in Administrators (S-1-5-32-544) or Domain Admins
-   [REQUIRED] Get-Changes-All extended right on the domain NC
-   ```
-   Neither alone is sufficient. Extended rights without admin group = 0x20f7.
-   Admin group without extended rights = not tested (but likely same).
+#### Braço B — Remove DRS_WRIT_REP (Flag Test)
 
-3. **This applies to BOTH Server 2016 and Server 2025** — identical behavior
-   confirmed via cross-version test. The documented tradecraft ("just delegate
-   Get-Changes-All") is incomplete: it only works in practice because the
-   accounts used in real attacks are typically already Administrators or
-   Domain Admins.
+Patched `secretsdump.py` line 646 to remove `DRS_WRIT_REP`:
+```python
+# Original: DRS_INIT_SYNC | DRS_WRIT_REP
+# Patched:  DRS_INIT_SYNC  # NO_WRIT_REP
+```
 
-4. **Why does this matter for detection?** SIEM rules that alert on
-   `Event 4662 + GUID 1131f6ad` from non-DA users may produce false
-   negatives if the adversary obtains Administrator access without
-   Domain Admins. Conversely, `0x20f7` events from non-admin users
-   indicate DCSync attempts — a different (and perhaps more interesting)
-   detection signal than the standard 4662 alert.
+**Result: 0x20f7.** Removing WRIT_REP does NOT fix the delegated DCSync.
+**Hypothesis (iii) FALSIFIED.** The flag is not the trigger.
 
-5. **Harness bug (unresolved):** The custom `DRSGetNCChanges` construction
-   produces `rpc_x_bad_stub_data` in all configurations. This is a
-   marshaling issue, not a permission issue. Future work: monkey-patch
-   secretsdump's in-memory attribute set.
+#### Braço A — Alternative Tool (nxc 1.5.1)
+
+`nxc smb 192.168.50.9 -u dcsync2 -p 'Test123!' -d WINDOMAIN2025 --ntds --user vagrant`
+
+**Result: 0x20f7** (same error) + `rpc_s_access_denied` on RemoteOperations.
+nxc uses the same impacket library under the hood, so this confirms impacket-
+based tools share the behavior but does not isolate tool-vs-DC.
+
+**Mimikatz test (planned):** The DetectionLab win10 VM (192.168.50.17) was
+unreachable after boot (ports 445/5985 unresponsive). Mimikatz could not be
+executed. This is the critical missing data point: if Mimikatz SUCCEEDS
+where impacket fails, hypothesis (ii) is confirmed. If it FAILS, (i) is
+confirmed. **Currently unresolved.**
+
+#### Braço A2 — Self-target test
+
+`secretsdump -just-dc-user dcsync2` (dcsync2 targeting its own credentials).
+
+**Result: 0x20f7.** Even targeting yourself fails — it's not about accessing
+another user's attributes. The DRSGetNCChanges RPC itself is rejected.
+
+#### Braço C — ACE Verification
+
+```
+Get-Acl "AD:\DC=windomain2025,DC=local" | ? {$_.IdentityReference -match "dcsync2"}
+  -> Allow ExtendedRight {1131f6aa} (Get-Changes)
+  -> Allow ExtendedRight {1131f6ad} (Get-Changes-All)
+```
+
+No Deny ACEs, no inherited blocking. The ACE set matches exactly what
+BloodHound's DCSync edge represents. The configuration is correct per
+documented tradecraft.
+
+---
+
+### Revised Conclusions (Updated 2026-08-01)
+
+**Status: (i) "DC requires admin membership" is the leading hypothesis
+but NOT fully confirmed.** Hypothesis (iii) is falsified. Hypothesis (ii)
+could not be tested due to lab constraints (Mimikatz unavailable).
+
+1. **Extended rights alone are insufficient.** Get-Changes + Get-Changes-All
+   on the domain NC is NOT enough — the user receives 0x20f7 from both
+   impacket and nxc. Adding BUILTIN\Administrators (or Domain Admins)
+   immediately resolves the error.
+
+2. **0x20f7 is NOT a missing-extended-right indicator.** It is returned
+   when the calling user lacks administrative group membership. This is
+   cross-version consistent (2016 and 2025).
+
+3. **The flag DRS_WRIT_REP is NOT the trigger.** Removing it does not
+   change the outcome. The authorization check is independent of this flag.
+
+4. **Tool independence is UNTESTED.** Both impacket and nxc use the same
+   underlying library. A Mimikatz test is required to confirm whether
+   the behavior is tool-specific or DC-enforced. Until then, the
+   conclusion "DC requires admin membership" should be treated as a
+   lab finding, not a general AD truth.
+
+5. **Practical implication:** The documented "ACE persistence" technique
+   (delegating Get-Changes-All to a non-admin user for stealth DCSync)
+   does NOT work with impacket-based tools in this lab configuration.
+   Whether it works with Mimikatz or other Windows-native DRS clients
+   remains an open question.
