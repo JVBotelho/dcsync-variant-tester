@@ -137,12 +137,13 @@ ERROR_DS_DRA_BAD_DN (0x20f7)
 | DCSync with SPECIAL_SECRET | Hash incorrect | Hash incorrect (same hash) |
 | Permission filtered-set-only | 0x20f7 | 0x20f7 (identical) |
 | Event 4662 structure | 1x All + 2x Get-Changes | 1x All + 2x Get-Changes (identical) |
-| Admin group required for DCSync | YES (Administrators) | YES (Administrators) (identical) |
+| Delegated account DCSync (see anomaly below) | `0x20f7` | `0x20f7` (identical) |
 
-**Cross-version isolation test (dcsync2):** Both 2016 and 2025 require
-`BUILTIN\Administrators` (or Domain Admins) membership in addition to
-`Get-Changes + Get-Changes-All` extended rights. Extended rights alone
-return `0x20f7` on both versions.
+**Cross-version isolation test (dcsync2):** In both lab forests, a delegated
+account holding `Get-Changes + Get-Changes-All` returned `0x20f7` and only
+succeeded after joining an administrative group. This contradicts documented
+tradecraft, and both DCs share the same lab template — see "Revised
+Conclusions" for why we publish this as an open anomaly, not a result.
 
 Microsoft did not change the DRS permission check logic between Server 2016
 and Server 2025. The authorization mechanism remains based on requested
@@ -160,9 +161,12 @@ attributes, not on DRS request flags.
 2. **The Event 4662 GUID is determined by the permission check, not by flags.**
    No flag combination avoids the `Get-Changes-All` check.
 
-3. **`Get-Changes-In-Filtered-Set` does NOT cover secret attributes.**
-   Even on Server 2025, this permission does not grant access to `unicodePwd`
-   and `supplementalCredentials`.
+3. **The account-permission dimension remains open.** We could not isolate
+   filtered-set behavior, because delegated DCSync failed in both lab forests
+   for reasons we could not determine (see "Revised Conclusions" — treated as
+   an anomaly, possibly environmental). The telemetry above comes from
+   administrative accounts; what a correctly delegated non-admin account
+   would produce is untested here.
 
 ### Detection timeline (identical to Server 2016):
 ```
@@ -312,8 +316,9 @@ Same error, same behavior.
 | **Mimikatz 2.2.0** | **Kerberos** | **Windows** | **0x20f7** |
 
 **Hypothesis (ii) FALSIFIED.** The behavior is NOT tool-specific.
-**Hypothesis (i) CONFIRMED.** The DC enforces administrative group
-membership for DRS replication regardless of tool or auth method.
+Within this lab, hypothesis (i) is the one the data supports — with an
+important scope limit: both DCs were promoted from the same DetectionLab
+template, so an environmental cause shared by both forests is not excluded.
 
 #### Braço A2 — Self-target test
 
@@ -336,30 +341,41 @@ documented tradecraft.
 
 ---
 
-### Revised Conclusions (Updated 2026-08-01 — Tiebreaker Complete)
+### Revised Conclusions (Updated 2026-08-02 — scoped to evidence)
 
-1. **The DC enforces administrative group membership for DRSGetNCChanges.**
-   Extended rights (Get-Changes + Get-Changes-All) alone are insufficient.
-   The user MUST be a member of BUILTIN\Administrators, Domain Admins, or
-   equivalent administrative group. This is confirmed by three independent
-   tools (impacket, nxc, Mimikatz) across two DC versions (2016, 2025).
+1. **In both lab forests, delegated DCSync failed.** Clean accounts holding
+   exactly `Get-Changes + Get-Changes-All` on the domain NC (ACEs verified,
+   zero deny ACEs, and even Generic All on the NC root in Test 4) received
+   `0x20f7` at `DRSGetNCChanges` — with impacket, NetExec, and Mimikatz 2.2.0,
+   over NTLM and Kerberos, on Server 2016 and Server 2025. Only membership in
+   Administrators or Domain Admins allowed the replication to proceed, and
+   removing the membership broke it again. This part is solid and reproducible.
 
-2. **This is NOT a tool-specific behavior.** Mimikatz 2.2.0, which uses the
-   Windows `DsGetNCChanges` API with Kerberos authentication, produces the
-   same 0x20f7 error as impacket (NTLM + raw DRS RPC). The enforcement is
-   at the DC level, not the client level.
+2. **The failure is at the DC, not the client.** Three independent tools and
+   two auth methods produce the identical error, so this is not an impacket
+   artifact. Hypothesis (iii) — `DRS_WRIT_REP` as the trigger — is falsified
+   (Braço B).
 
-3. **The flag DRS_WRIT_REP is not the trigger.** Removing it does not change
-   the outcome (Braço B). The administrative group check is independent of
-   the replication flags.
+3. **What we are NOT claiming: an authorization model for AD.** Documented
+   tradecraft and a decade of field evidence say delegated DCSync works
+   without admin membership — BloodHound's DCSync edge is computed from
+   exactly the rights pair we granted. Both of our DCs were promoted from the
+   same DetectionLab template, so an environmental cause shared by both
+   forests cannot be ruled out. Until someone reproduces this on a
+   non-lab DC, this is an **open anomaly, not a result**.
 
-4. **Cross-version consistent.** Both Server 2016 and Server 2025 exhibit
-   identical behavior: delegated accounts require admin group membership
-   for DCSync to succeed.
+4. **For detection engineers:** `0x20f7` is not a reliable "missing
+   Get-Changes-All" indicator. In these tests it also fired for non-admin
+   accounts holding every relevant extended right. Treat it as
+   "DRSGetNCChanges rejected" and investigate context before attributing cause.
 
-5. **Practical implication:** The documented "ACE persistence" technique —
-   delegating Replicating Directory Changes + Replicating Directory Changes All
-   to a non-admin user for stealth DCSync — does NOT work with impacket,
-   nxc, or Mimikatz. The user must also be an Administrator, Domain Admin,
-   or equivalent. This contradicts popular tradecraft but is confirmed by
-   reproducible evidence on two DC versions with three tools.
+5. **Harness bug (unresolved):** the custom `DRSGetNCChanges` construction
+   produces `rpc_x_bad_stub_data` in all configurations (marshaling issue,
+   not permissions). Future work: monkey-patch secretsdump's in-memory
+   attribute set instead.
+
+6. **One external data point decides this.** If you have a non-lab,
+   non-DetectionLab DC: create a test account with Get-Changes +
+   Get-Changes-All on the domain NC and run secretsdump. Success or
+   `0x20f7` — either answer resolves the anomaly. Open an issue with the
+   OS version and build.
