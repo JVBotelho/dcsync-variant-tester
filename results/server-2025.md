@@ -137,6 +137,12 @@ ERROR_DS_DRA_BAD_DN (0x20f7)
 | DCSync with SPECIAL_SECRET | Hash incorrect | Hash incorrect (same hash) |
 | Permission filtered-set-only | 0x20f7 | 0x20f7 (identical) |
 | Event 4662 structure | 1x All + 2x Get-Changes | 1x All + 2x Get-Changes (identical) |
+| Admin group required for DCSync | YES (Administrators) | YES (Administrators) (identical) |
+
+**Cross-version isolation test (dcsync2):** Both 2016 and 2025 require
+`BUILTIN\Administrators` (or Domain Admins) membership in addition to
+`Get-Changes + Get-Changes-All` extended rights. Extended rights alone
+return `0x20f7` on both versions.
 
 Microsoft did not change the DRS permission check logic between Server 2016
 and Server 2025. The authorization mechanism remains based on requested
@@ -172,111 +178,113 @@ attributes, not on DRS request flags.
 
 ## Control Tests — Permission Rejection Isolation
 
-**Date:** 2026-08-01  
-**Objective:** Distinguish "DC rejects because of secret attributes" from
-"the dsacls setup was wrong." Three control arms were executed.
+**Date:** 2026-08-01 (initial) and 2026-08-01 (isolation round)
 
-### Setup
+### Initial Round (dcsynctest, 3 control arms)
+
+**Arm 0:** Reproduced 0x20f7 with dcsynctest (Get-Changes + Filtered-Set only).  
+**Arm 1:** Blocked by harness bug (rpc_x_bad_stub_data). LDAP proxy evidence
+confirms filtered-set works for non-secret attrs.  
+**Arm 2:** Discovered that adding dcsynctest to Domain Admins made DCSync work,
+while extended rights alone (even Full Control on NC) did not.
+
+**Initial hypothesis:** DCSync requires Domain Admins.
+
+---
+
+### Isolation Round — Delegated DCSync Without Domain Admins
+
+**Objective:** The Arm 2 finding contradicted well-established tradecraft.
+A clean account (`dcsync2`) was tested to isolate the variable.
+
+#### Test 1 — Clean Delegated Setup (2025 DC)
 
 ```
 # gitleaks:allow
-net user dcsynctest "Test123!" /add /domain
-dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsynctest:CA;Replicating Directory Changes"
-dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsynctest:CA;Replicating Directory Changes In Filtered Set"
+net user dcsync2 "Test123!" /add /domain
+dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsync2:CA;Replicating Directory Changes"
+dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsync2:CA;Replicating Directory Changes All"
 ```
 
-Verified via `dsacls` — account has exactly `Replicating Directory Changes`
-and `Replicating Directory Changes In Filtered Set` (no Get-Changes-All).
+dcsync2 has EXACTLY: Domain Users group + Get-Changes + Get-Changes-All.  
+**Result:** `0x20f7` — FAILS.
 
-All tests use impacket 0.13.1 on Parrot Linux.
+#### Test 2 — Deny ACE Audit
 
----
+Full ACL dump of the domain NC. **ZERO Deny ACEs found.** No explicit
+blocking of dcsync2 directly or via group membership (Everyone, Auth Users,
+Domain Users, Pre-Win2K).
 
-### Arm 0 — Reproduce Rejection
+#### Test 3 — Debug RPC Trace
 
 ```
-impacket-secretsdump -just-dc-user vagrant -target-ip 192.168.50.9 \
-  "WINDOMAIN2025/dcsynctest:Test123!@192.168.50.9"
+[+] Calling DRSCrackNames for Administrator -> SUCCESS
+[+] Calling DRSGetNCChanges for {guid}        -> 0x20f7
 ```
 
-**Result:** `ERROR_DS_DRA_BAD_DN (0x20f7)`. No Event 4662.  
-Reproduction confirmed.
+The failure occurs at `DRSGetNCChanges` line 662 (secretsdump.py 0.13.1).
+DRSBind and DRSCrackNames succeed. Only the actual replication request fails.
 
----
+#### Test 4 — Granting ALL Extended Rights
 
-### Arm 1 — Positive Control (Non-secret Attrs)
+Added: Replication Synchronization, Manage Replication Topology, Filtered Set,
+Full Control (GA) on domain NC, Generic Read, Schema NC Get-Changes-All.
+All extra ACEs beyond the documented pair. **Result: STILL 0x20f7.**
 
-**Goal:** DRSGetNCChanges with `pPartialAttrSet = [name, objectClass, instanceType]`
-(non-secret attributes only).
+Extended rights alone — even FULL CONTROL — are insufficient.
 
-**Blocked:** Custom DRS harness (`drs_single.py`) produces `rpc_x_bad_stub_data`
-regardless of credentials or attribute set — a marshaling bug, not a
-permission issue. Filed as a harness bug.
+#### Test 5 — Administrative Group Membership
 
-**Corroborating evidence:** LDAP search with dcsynctest (same permission as
-Get-Changes-In-Filtered-Set) returns non-secret attributes successfully:
-```
-Get-ADUser -Filter * -Properties name,objectClass,instanceType
-  -> SUCCESS: CN=Administrator,CN=Users,DC=windomain2025,DC=local
-```
+| Group | Get-Changes + Get-Changes-All | Result |
+|---|---|---|
+| Domain Users only | YES | 0x20f7 |
+| BUILTIN\Administrators | YES | **SUCCESS** (hash e02bc50...) |
+| Domain Admins | YES | **SUCCESS** |
 
-`repadmin /showrepl` also runs successfully, confirming filtered-set
-permissions are functional for DRS operations.
+Removing from Administrators (keeping extended rights) returns to 0x20f7.
+Adding BACK to Administrators (no other changes) restores success.
 
-**Verdict:** Partial confirmation — proxy evidence supports that non-secret
-DRS operations would succeed, but direct DRSGetNCChanges could not be tested.
-
----
-
-### Arm 2 — Grant Control
-
-**Step 1:** Grant `Get-Changes-All` + `Generic Read` on domain NC:
-```
-dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsynctest:CA;Replicating Directory Changes All"
-dsacls "dc=windomain2025,dc=local" /I:S /G "WINDOMAIN2025\dcsynctest:GR"
-```
-
-**Result:** STILL `0x20f7`. Extended rights alone are INSUFFICIENT for DCSync.
-
-**Step 2:** Add dcsynctest to Domain Admins:
-```
-Add-ADGroupMember -Identity "Domain Admins" -Members dcsynctest
-```
-
-**Result:** **SUCCESS** — hash `e02bc503339d51f71d913c245d35b50b` returned.
-
-**Event 4662:** LogonID `0x125FFFF`, Subject: `dcsynctest`  
+**Event 4662 (dcsync2 as Administrator):** LogonID `0x12B89C4`, Subject `dcsync2`  
 GUIDs: `{1131f6ad}` (Get-Changes-All) + `{1131f6aa}` x2 (Get-Changes)
 
-**Step 3:** Remove from Domain Admins, keep extended rights.  
-Returns to `0x20f7`.
+#### Test 6 — Cross-Version (Server 2016)
 
-**Step 4:** Revoke all ACEs, delete dcsynctest. Cleanup confirmed.
+Same setup (dcsync2, Get-Changes + Get-Changes-All only, Domain Users).
+**Result: 0x20f7** — identical to 2025.  
+Adding dcsync2 to BUILTIN\Administrators: **SUCCESS**.  
+Behavior is cross-version consistent.
 
 ---
 
-### Conclusions
+### Revised Conclusions
 
-1. **DCSync requires Domain Admins (or equivalent).** Extended rights alone
-   are insufficient — even with `Get-Changes-All` explicitly granted on
-   both domain and config NCs, a non-DA user receives `0x20f7`.
+1. **`0x20f7` is NOT a missing-Get-Changes-All indicator.** It is returned
+   when the calling user lacks administrative group membership, regardless
+   of extended rights. Hypothesis (a) — "artifact of lab setup" — is
+   **FALSIFIED**. The denial is real and consistent.
 
-2. **`0x20f7` is not attribute-specific.** It also appears when the user
-   lacks the administrative group membership required to open the DRS
-   handle. The original permission test was testing TWO variables:
-   extended rights AND administrative group membership.
-
-3. **Updated DCSync permission model (Server 2025):**
+2. **The DCSync authorization model requires BOTH:**
    ```
-   [REQUIRED] Domain Admins (or equivalent admin group)
-   [REQUIRED] Get-Changes-All extended right on domain NC
+   [REQUIRED] Membership in Administrators (S-1-5-32-544) or Domain Admins
+   [REQUIRED] Get-Changes-All extended right on the domain NC
    ```
-   Without either: `0x20f7` (same error code for both cases).
+   Neither alone is sufficient. Extended rights without admin group = 0x20f7.
+   Admin group without extended rights = not tested (but likely same).
 
-4. **Detection implication:** `0x20f7` is not a reliable discriminator for
-   "missing Get-Changes-All." It also indicates a non-privileged user
-   attempting DCSync. SIEM rules should handle both cases.
+3. **This applies to BOTH Server 2016 and Server 2025** — identical behavior
+   confirmed via cross-version test. The documented tradecraft ("just delegate
+   Get-Changes-All") is incomplete: it only works in practice because the
+   accounts used in real attacks are typically already Administrators or
+   Domain Admins.
 
-5. **Harness bug:** The custom `DRSGetNCChanges` construction produces
-   `rpc_x_bad_stub_data`. Future work should fix the DSNAME/prefix table
-   encoding or monkey-patch secretsdump's in-memory attribute set.
+4. **Why does this matter for detection?** SIEM rules that alert on
+   `Event 4662 + GUID 1131f6ad` from non-DA users may produce false
+   negatives if the adversary obtains Administrator access without
+   Domain Admins. Conversely, `0x20f7` events from non-admin users
+   indicate DCSync attempts — a different (and perhaps more interesting)
+   detection signal than the standard 4662 alert.
+
+5. **Harness bug (unresolved):** The custom `DRSGetNCChanges` construction
+   produces `rpc_x_bad_stub_data` in all configurations. This is a
+   marshaling issue, not a permission issue. Future work: monkey-patch
+   secretsdump's in-memory attribute set.
