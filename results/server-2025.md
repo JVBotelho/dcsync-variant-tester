@@ -135,15 +135,14 @@ ERROR_DS_DRA_BAD_DN (0x20f7)
 | GUID 1131f6ad in V1-V5 | YES | YES (identical) |
 | GUID 89e95b76 in any variant | NO | NO (identical) |
 | DCSync with SPECIAL_SECRET | Hash incorrect | Hash incorrect (same hash) |
-| Permission filtered-set-only | 0x20f7 | 0x20f7 (identical) |
+| Permission filtered-set-only (correct ACE scope) | `0x2105` ACCESS_DENIED | `0x2105` (identical) |
 | Event 4662 structure | 1x All + 2x Get-Changes | 1x All + 2x Get-Changes (identical) |
-| Delegated account DCSync (see anomaly below) | `0x20f7` | `0x20f7` (identical) |
+| Delegated account DCSync (correct ACE scope) | SUCCESS | SUCCESS (identical) |
 
-**Cross-version isolation test (dcsync2):** In both lab forests, a delegated
-account holding `Get-Changes + Get-Changes-All` returned `0x20f7` and only
-succeeded after joining an administrative group. This contradicts documented
-tradecraft, and both DCs share the same lab template — see "Revised
-Conclusions" for why we publish this as an open anomaly, not a result.
+**Delegated DCSync works as documented on both versions — once the ACE scope
+is correct.** All earlier `0x20f7` results for delegated accounts were caused
+by `dsacls /I:S` creating inherit-only ACEs that never applied to the domain
+head object. See "Root Cause — Inherit-Only ACE (/I:S)" below.
 
 Microsoft did not change the DRS permission check logic between Server 2016
 and Server 2025. The authorization mechanism remains based on requested
@@ -161,12 +160,12 @@ attributes, not on DRS request flags.
 2. **The Event 4662 GUID is determined by the permission check, not by flags.**
    No flag combination avoids the `Get-Changes-All` check.
 
-3. **The account-permission dimension remains open.** We could not isolate
-   filtered-set behavior, because delegated DCSync failed in both lab forests
-   for reasons we could not determine (see "Revised Conclusions" — treated as
-   an anomaly, possibly environmental). The telemetry above comes from
-   administrative accounts; what a correctly delegated non-admin account
-   would produce is untested here.
+3. **`Get-Changes-In-Filtered-Set` does not cover secret attributes.** With a
+   correctly scoped ACE, a filtered-set-only account requesting credential
+   attributes gets `0x2105` (ACCESS_DENIED), and the Filtered-Set right
+   (`89e95b76`) is not even checked — the Event 4662 trail shows only
+   `1131f6aa`. See "Root Cause — Inherit-Only ACE (/I:S)" for the real
+   Dimension C results.
 
 ### Detection timeline (identical to Server 2016):
 ```
