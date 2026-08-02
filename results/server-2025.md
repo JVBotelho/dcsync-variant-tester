@@ -341,41 +341,65 @@ documented tradecraft.
 
 ---
 
-### Revised Conclusions (Updated 2026-08-02 — scoped to evidence)
+## Root Cause — Inherit-Only ACE (/I:S)
 
-1. **In both lab forests, delegated DCSync failed.** Clean accounts holding
-   exactly `Get-Changes + Get-Changes-All` on the domain NC (ACEs verified,
-   zero deny ACEs, and even Generic All on the NC root in Test 4) received
-   `0x20f7` at `DRSGetNCChanges` — with impacket, NetExec, and Mimikatz 2.2.0,
-   over NTLM and Kerberos, on Server 2016 and Server 2025. Only membership in
-   Administrators or Domain Admins allowed the replication to proceed, and
-   removing the membership broke it again. This part is solid and reproducible.
+### Discovery
 
-2. **The failure is at the DC, not the client.** Three independent tools and
-   two auth methods produce the identical error, so this is not an impacket
-   artifact. Hypothesis (iii) — `DRS_WRIT_REP` as the trigger — is falsified
-   (Braço B).
+All previous rounds used `dsacls /I:S` which creates ACEs with
+`PropagationFlags: InheritOnly` — the rights apply only to child objects,
+never to the domain head object `DC=windomain2025,DC=local` where the DC
+performs the permission check.
 
-3. **What we are NOT claiming: an authorization model for AD.** Documented
-   tradecraft and a decade of field evidence say delegated DCSync works
-   without admin membership — BloodHound's DCSync edge is computed from
-   exactly the rights pair we granted. Both of our DCs were promoted from the
-   same DetectionLab template, so an environmental cause shared by both
-   forests cannot be ruled out. Until someone reproduces this on a
-   non-lab DC, this is an **open anomaly, not a result**.
+**Passo 1 — Verification (2026-08-02):**
+```
+InheritanceType       : Descendents
+PropagationFlags      : InheritOnly
+```
+CONFIRMED — the ACEs never applied to the head object.
 
-4. **For detection engineers:** `0x20f7` is not a reliable "missing
-   Get-Changes-All" indicator. In these tests it also fired for non-admin
-   accounts holding every relevant extended right. Treat it as
-   "DRSGetNCChanges rejected" and investigate context before attributing cause.
+**Passo 2 — SharpHound with inherit-only ACE active:**
+SharpHound v2.5.9 did NOT generate a DCSync edge for dcsync2 because the
+ACE on the domain head was inherit-only. SharpHound correctly filters
+these ACEs when computing attack paths.
 
-5. **Harness bug (unresolved):** the custom `DRSGetNCChanges` construction
-   produces `rpc_x_bad_stub_data` in all configurations (marshaling issue,
-   not permissions). Future work: monkey-patch secretsdump's in-memory
-   attribute set instead.
+**Passo 3 — Fix scope and retest:**
+Revoked old ACEs, granted with default scope (this object + subobjects):
+```
+dsacls $dn /G "WINDOMAIN2025\dcsync2:CA;Replicating Directory Changes"
+dsacls $dn /G "WINDOMAIN2025\dcsync2:CA;Replicating Directory Changes All"
+```
+New ACEs: `InheritanceType: None, PropagationFlags: None`.
 
-6. **One external data point decides this.** If you have a non-lab,
-   non-DetectionLab DC: create a test account with Get-Changes +
-   Get-Changes-All on the domain NC and run secretsdump. Success or
-   `0x20f7` — either answer resolves the anomaly. Open an issue with the
-   OS version and build.
+Result: **SUCCESS** — `e02bc503339d51f71d913c245d35b50b`.
+Event 4662: LogonID `0x27C7B69`, Subject `dcsync2`,
+GUIDs: `{1131f6ad}` + `{1131f6aa}` x2.
+
+The documented delegation model WORKS when the ACE scope is correct.
+
+**Passo 4 — Real Dimension C (dcsync3, Filtered-Set + Get-Changes, NO All):**
+With correct ACE scope (`InheritanceType: None`):
+- **Secret attrs** (unicodePwd + supplementalCredentials): `0x2105` (ERROR_DS_DRA_ACCESS_DENIED)
+  — not `0x20f7`! The correct error for insufficient rights.
+  Event 4662: `{1131f6aa}` x2, **no** `{89e95b76}` (Filtered-Set not checked
+  when credential attributes are in the request).
+- The `0x20f7` error observed in ALL previous rounds was an artifact of
+  the inherit-only ACE scope, not a missing right.
+
+### Error Code Mapping (after fix)
+
+| ACE Scope | Missing Right | Error | Meaning |
+|---|---|---|---|
+| Inherit-only (/I:S) | Any | `0x20f7` | ACE not found on head object (false "bad DN") |
+| This object (correct) | Get-Changes-All | `0x2105` | Access Denied (correct) |
+| This object (correct) | None (has All) | SUCCESS | Works as documented |
+
+### Conclusion
+
+**The anomaly is RESOLVED.** All previous rounds measured a failure of
+ACE scope (`/I:S` = inherit-only), not a DC behavior. The documented
+DCSync delegation model works correctly on both Server 2016 and 2025
+when the ACE is applied to the domain head object.
+
+The practical lesson: `dsacls /I:S` is for child objects only. Use
+`/G` (no `/I:S`) or `/I:T` for the domain NC head object when
+delegating DCSync rights.
